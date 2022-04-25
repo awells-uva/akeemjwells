@@ -1,0 +1,4122 @@
+---
+title: "Disaster Relief Project Part 2"
+author: "Akeem Wells"
+date: "`r Sys.Date()`"
+output: rmdformats::material
+code_folding: hide
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r Imports, warning=FALSE}
+# ggpairs
+library(ggplot2)
+library(GGally)
+library(hrbrthemes)
+# %>%
+library(tidyverse)
+
+# kfold
+library(caret)
+kfoldcv = 10
+
+# lda
+library(MASS)
+
+# prediction
+library(ROCR)
+
+#partimat
+library(klaR)
+
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+library(parallel)
+library(future)
+library(doParallel)
+cl <- future::makeClusterPSOCK(4, outfile = NULL, verbose = FALSE)
+```
+
+```{r Functions}
+get_metric <- function(caret_CM_object, metric){
+  caret_CM_object %>% broom::tidy() %>% 
+    dplyr::filter(term==metric) %>%
+    dplyr::select(estimate) %>% pull()
+}
+
+get_metrics_func <- function(caret_CM_objects, metric, func){
+  caret_CM_objects %>% 
+    purrr::map( ~ get_metric(.x, metric)) %>%
+    unlist() %>% func
+}
+
+get_out_of_folds_CM <- function(classifier){
+  out_of_folds_CM <- classifier$pred %>%
+  dplyr::mutate(pred2 = ifelse(Up > THRESHOLD, 'Up', 'Down')) %>%
+  dplyr::mutate(pred2 = factor(pred2, levels = c('Down', 'Up'))) %>%
+  dplyr::group_split(Resample) %>%
+  purrr::map( ~ caret::confusionMatrix(data=.x$pred2, reference=.x$obs, 
+                                       positive='Up'))
+}
+
+plot_folds_CM <- function(classifier,THRESHOLD ){
+  out_of_folds_CM <- classifier$pred %>% 
+    dplyr::mutate(pred2 = ifelse(Up>THRESHOLD, 'Up', 'Down')) %>%
+    dplyr::mutate(pred2 = factor(pred2, levels=c('Down','Up'))) %>%
+    dplyr::group_split(Resample) %>%
+    purrr::map(~ caret::confusionMatrix(data=.x$pred2, reference=.x$obs))
+  
+  out_of_folds_CM_vis <- out_of_folds_CM %>% 
+    purrr::map(~ .x$table %>% broom::tidy() %>%
+                   ggplot(aes(x=Reference, y=Prediction, fill=n, label=n)) +
+                   geom_tile() + geom_text(aes(label=n), size=5, color='white'))
+   
+  gridExtra::grid.arrange(grobs=out_of_folds_CM_vis, ncol=2)
+}
+
+tuned_call <- function(preds, decision_rule_threshold){
+  calls <- rep('Down', length(preds))
+  calls[preds>decision_rule_threshold]='Up'
+  factor(calls, levels=c('Down','Up'))
+}
+
+get_optimal_threshold <- function(classifier){
+  
+  thresholds = seq(0.001,0.5,.001) # Avoid Threshold Tails
+  F_1_scores <- rep(NA, length(thresholds))
+  GMeans <- rep(NA, length(thresholds))
+  
+  preds <- predict(classifier, type='prob')[,2]
+  y <- train$BlueTarp_rest
+  for (i in 1:length(thresholds)){
+    yhat <- tuned_call(preds, thresholds[i])
+    one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+    sensitivity <- mean(yhat[y=='Up']=='Up')
+    one_minus_specificity
+    sensitivity
+    results <- tibble::tibble(y=y, yhat=yhat)
+    
+    caret::confusionMatrix(yhat, y, positive = "Up") 
+    cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+    
+    trueNegative  = cm$table[1,1]
+    falseNegative = cm$table[1,2]
+    falsePositive = cm$table[2,1]
+    truePositve   = cm$table[2,2]
+    
+    #paste0("True Positive: ", truePositve )
+    #paste0("False Negative: ", falseNegative )
+    #paste0("True Negative: ", trueNegative )
+    #paste0("False Positive: ", falsePositive )
+    conditionPositive = truePositve + falseNegative
+    conditionNegative = trueNegative + falsePositive 
+    predictedConditionPositive = truePositve +  falsePositive 
+    predictedConditionNegative = trueNegative + falseNegative
+    
+    TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+    
+    prevalence = conditionPositive / TotalPopulation
+    accuracy = (truePositve + trueNegative) / TotalPopulation
+    PPV = truePositve / predictedConditionPositive
+    FDR = falsePositive / predictedConditionPositive
+    FOR = falseNegative / predictedConditionNegative
+    NPV = trueNegative / predictedConditionNegative
+    TPR = truePositve / conditionPositive
+    FPR = falsePositive / conditionNegative
+    FNR = falseNegative / conditionPositive
+    SPC = TNR = trueNegative / conditionNegative
+    LR.PLUS = TPR / FPR
+    LR.MINUS = FNR/TNR
+    DOR = LR.PLUS / LR.MINUS
+    
+    F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+    F_1_scores[i] <- F_1_score
+    GMeans[i] = sqrt(TPR*SPC)
+  }
+  
+  plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+  opt_thresh = thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]
+  return(opt_thresh)
+}
+
+stat_fho <- function(classifier, testdata, threshold){
+  y <- testdata$BlueTarp_rest
+  preds <- predict(classifier, newdata = testdata, type = "prob")[,2]
+  yhat <- tuned_call(preds, threshold)
+  
+  one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+  sensitivity <- mean(yhat[y=='Up']=='Up')
+  one_minus_specificity
+  sensitivity
+  results <- tibble::tibble(y=y, yhat=yhat)
+  
+  caret::confusionMatrix(yhat, y, positive = "Up") 
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  prevalence = conditionPositive / TotalPopulation
+  accuracy = (truePositve + trueNegative) / TotalPopulation
+  PPV = truePositve / predictedConditionPositive
+  FDR = falsePositive / predictedConditionPositive
+  FOR = falseNegative / predictedConditionNegative
+  NPV = trueNegative / predictedConditionNegative
+  TPR = truePositve / conditionPositive
+  FPR = falsePositive / conditionNegative
+  FNR = falseNegative / conditionPositive
+  SPC = TNR = trueNegative / conditionNegative
+  LR.PLUS = TPR / FPR
+  LR.MINUS = FNR/TNR
+  DOR = LR.PLUS / LR.MINUS
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  
+  # accuracy, sensitivity, specificity, FDR, precision
+  return(c(accuracy, TPR, SPC, FDR, PPV  ))
+}
+```
+
+# Introduction
+
+In this project, you will use classification methods covered in this course to solve a real historical data mining problem: locating displaced persons living in makeshift shelters following the destruction of the earthquake in Haiti in 2010.
+
+Following that earthquake, rescue workers, mostly from the United States military, needed to get food and water to the displaced persons. But with destroyed communications, impassable roads, and thousands of square miles, actually locating the people who needed help was challenging. As part of the rescue effort, a team from the Rochester Institute of Technology were flying an aircraft to collect high resolution geo-referenced imagery.
+
+```{r}
+HaitiPixels <- read.csv(file = '/Users/awells/UVA/SYS6018/Disaster_Relief_Project/HaitiPixels.csv')
+head(HaitiPixels)
+
+HaitiPixels$Class <- as.factor(HaitiPixels$Class)
+#summary(HaitiPixels)
+
+dim(HaitiPixels)
+summary(HaitiPixels)
+attach(HaitiPixels)
+```
+
+ 
+
+```{r}
+detach(HaitiPixels)
+# Blue Tarp
+BlueTarp_rest <- rep("0",length(HaitiPixels$Class))
+BlueTarp_rest[HaitiPixels$Class == "Blue Tarp"] <- "1"
+
+HaitiPixels <- data.frame(HaitiPixels,BlueTarp_rest )
+
+HaitiPixels$BlueTarp_rest <- as.factor(HaitiPixels$BlueTarp_rest)
+
+#summary(HaitiPixels)
+attach(HaitiPixels)
+BlueTarp_rest <- as.factor(BlueTarp_rest)
+
+#### Delete these 2 lines when ready for full set
+#index <- createDataPartition(HaitiPixels$BlueTarp_rest, p = 0.1, list = FALSE) # ~15K
+#index <- createDataPartition(HaitiPixels$BlueTarp_rest, p = 0.25, list = FALSE) # ~15K
+#index <- createDataPartition(HaitiPixels$BlueTarp_rest, p = 0.32, list = FALSE) # ~20K
+#index <- createDataPartition(HaitiPixels$BlueTarp_rest, p = 0.5, list = FALSE) # ~30K
+
+#data <- HaitiPixels[index, ]
+#HaitiPixels <- data
+#### 
+
+summary(HaitiPixels)
+
+```
+
+```{r warning=FALSE}
+HaitiPixels %>% ggpairs(upper=list(continuous=wrap("cor", size=3)))
+```
+
+For the set up of the data set ( HaitiPixels, $n=$ `r toString(nrow(HaitiPixels))`) a likely decision is to use a one vs rest approach.  Our data is a multi-class classification problem with binary classifications: 
+
+* Blue Tarp  vs [  Rooftop , Soil , Various Non-Tarp, Vegetation ]
+
+* Rooftop vs [ Blue Tarp,  Soil , Various Non-Tarp, Vegetation ]
+
+* Soil vs [ Blue Tarp,  Rooftop , Various Non-Tarp, Vegetation ]
+
+* Various Non-Tarp vs [ Blue Tarp,  Rooftop , Soil , Vegetation ]
+
+* Vegetation vs [ Blue Tarp,  Rooftop , Soil , Various Non-Tarp ]
+
+```{r}
+# Get Final Hold - Out 5% of Data ~3000 observations
+#data.fho = sort(sample(nrow(HaitiPixels), nrow(HaitiPixels)*.05))
+
+#fho <- HaitiPixels[data.fho,]
+
+train <- HaitiPixels
+
+# shuffle just to be safe
+train <- dplyr::sample_n(train, nrow(train))
+#fho <- dplyr::sample_n(fho, nrow(fho))
+
+train$BlueTarp_rest <- as.factor(train$BlueTarp_rest)
+levels(train$BlueTarp_rest) <- c("Down","Up")
+y <- train$BlueTarp_rest
+```
+
+Since we are looking for  temporary shelters made using blue tarps, we generated a variable named “BlueTarp_rest”, a binary classifier that has two levels 
+
+* “Up” - if a blue tarp was visible (or up )
+
+* “Down” - if a blue tarp was not visible.
+
+## Orthovnir Hold-Out Test Data Set 
+
+It was known that the people whose homes had been destroyed by the earthquake were creating temporary shelters using blue tarps, and these blue tarps would be good indicators of where the displaced persons were – if only they could be located in time, out of the thousands of images that would be collected every day.
+
+```{r}
+#orthovnir057_ROI_NON_Blue_Tarps.txt
+
+ovnir057.NoBlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir057_ROI_NON_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir057.NoBlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Down",length(ovnir057.NoBlueTarps$ID))
+ovnir057.NoBlueTarps <- data.frame(ovnir057.NoBlueTarps,BlueTarp_rest )
+
+#orthovnir067_ROI_Blue_Tarps.txt
+
+ovnir067.BlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir067_ROI_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir067.BlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Up",length(ovnir067.BlueTarps$ID))
+ovnir067.BlueTarps <- data.frame(ovnir067.BlueTarps,BlueTarp_rest )
+
+#orthovnir067_ROI_NOT_Blue_Tarps.txt
+
+ovnir067.NoBlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir067_ROI_NOT_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir067.NoBlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Down",length(ovnir067.NoBlueTarps$ID))
+ovnir067.NoBlueTarps <- data.frame(ovnir067.NoBlueTarps,BlueTarp_rest )
+
+#orthovnir069_ROI_Blue_Tarps.txt
+
+ovnir069.BlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir069_ROI_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir069.BlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Up",length(ovnir069.BlueTarps$ID))
+ovnir069.BlueTarps <- data.frame(ovnir069.BlueTarps,BlueTarp_rest )
+
+#orthovnir069_ROI_NOT_Blue_Tarps.txt
+ovnir069.NoBlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir069_ROI_NOT_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir069.NoBlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Down",length(ovnir069.NoBlueTarps$ID))
+ovnir069.NoBlueTarps <- data.frame(ovnir069.NoBlueTarps,BlueTarp_rest )
+
+#orthovnir078_ROI_Blue_Tarps.txt
+
+ovnir078.BlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir078_ROI_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir078.BlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Up",length(ovnir078.BlueTarps$ID))
+ovnir078.BlueTarps <- data.frame(ovnir078.BlueTarps,BlueTarp_rest )
+
+#orthovnir078_ROI_NON_Blue_Tarps.txt
+ovnir078.NoBlueTarps <- read.delim("/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir078_ROI_NON_Blue_Tarps.txt",comment.char=";", header = FALSE, sep = "")
+
+colnames(ovnir078.NoBlueTarps) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue")
+BlueTarp_rest <- rep("Down",length(ovnir078.NoBlueTarps$ID))
+ovnir078.NoBlueTarps <- data.frame(ovnir078.NoBlueTarps,BlueTarp_rest )
+
+#summary(ovnir067.NoBlueTarps)
+
+fho <- rbind(
+  ovnir057.NoBlueTarps,
+  ovnir067.BlueTarps,
+  ovnir067.NoBlueTarps,
+  ovnir069.BlueTarps,
+  ovnir069.NoBlueTarps,
+  ovnir078.BlueTarps,
+  ovnir078.NoBlueTarps
+  )
+fho$BlueTarp_rest <- factor(fho$BlueTarp_rest)
+
+#### Delete these 2 lines when ready for full set
+#index.fho <- createDataPartition(fho$BlueTarp_rest, p = 0.1, list = FALSE) 
+#data.fho <- fho[index.fho, ]
+#fho <- data.fho
+#### 
+
+# Scale Data
+#fho.scale <- scale(subset(fho, select= -c(BlueTarp_rest)), center = TRUE, scale = TRUE)
+#df <- data.frame(fho.scale, fho$BlueTarp_rest)
+#fho <- df
+colnames(fho) <- c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "Red", "Green", "Blue","BlueTarp_rest")
+```
+
+
+![Sample Data Makeshift Villiage](/Users/awells/UVA/SYS6018/Disaster_Relief_Project/hold_out_data/orthovnir078_makeshift_villiage1.jpg)
+
+Our goal is to test a variety of algorithms from this course on the imagery data collected during the relief efforts made Haiti in response to the 2010 earthquake. This leaves a Hold-Out Test Data Set of $n=$ `r toString(nrow(fho))` observations. 
+
+
+# K-Folds Out of Sampling Performance: K-Nearest Neighbors
+
+The first classification process that we used is the K-nearest neighbors regression. Given a value for K and a prediction point $x_0$, KNN regression first identifies the K training observations that are closest to $x_0$, represented by $N_0$.  The optimal value for K will depend on the bias-variance trade-off. A small value for K provides the most flexible fit, which will have low bias but high variance. This variance is due to the fact that the prediction in a given region is entirely dependent on just one observation. In contrast, larger values of K provide a smoother and less variable fit; the prediction in a region is an average of several points, and so changing one observation has a smaller effect. We’ll use the caret package in R to apply the KNN classification procedure using a 10 - Fold Cross-Validation evaluation procedure. 
+
+```{r caret KNN}
+set.seed(1)
+registerDoParallel(cl)
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.knn <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="knn", 
+              preProcess=c("center","scale"), 
+              tuneGrid=data.frame(k=seq(1,17,2)),
+              trControl = caret::trainControl("cv", number=kfoldcv, 
+                          returnResamp='all', savePredictions='final',
+                          classProbs=TRUE))
+stopCluster(cl)
+```
+
+```{r}
+classifier.knn
+bestk = classifier.knn$bestTune
+```
+
+Training across various values of K, we can see that our optimal K is `r toString(bestk)`.  So we’ll proceed with the analysis using this value. 
+
+```{r}
+classifier.knn %>% ggplot(aes(x=seq_along(Accuracy), y=Accuracy))
+```
+
+```{r message=FALSE, warning=FALSE}
+classifier.knn$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.knn$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model. We'll use the image below as a reference to analyzing the matrix.
+
+![Confusion Matrix Reference](/Users/awells/UVA/SYS6018/Disaster_Relief_Project/confmat.png)
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.knn,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.knn <- get_out_of_folds_CM(classifier.knn)
+classifier.knn.sensitivity.mean <- get_metrics_func(out_of_folds_CM.knn, 'sensitivity', mean)
+classifier.knn.sensitivity.sd <- get_metrics_func(out_of_folds_CM.knn, 'sensitivity', sd)
+
+classifier.knn.specificity.mean <- get_metrics_func(out_of_folds_CM.knn, 'specificity', mean)
+classifier.knn.specificity.sd <- get_metrics_func(out_of_folds_CM.knn, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+
+* Sensitivity Mean: `r toString(classifier.knn.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.knn.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.knn.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.knn.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+From the 10-Fold cross validation we can see we have our true positive references to a blue tarp. We can measure the sensitivity also known as the true positive rate. This is the fraction of observations that are correctly identified, using a given threshold value. The initial default threshold is `r toString(THRESHOLD)`. The false positive rate is 1-specificity; the fraction of observations that we classify incorrectly, using that same threshold value of `r toString(THRESHOLD)`. We can view the receiver operating characteristic curve or ROC curve to measure these two statistics. The ideal ROC curve hugs the top left corner, indicating a high true positive rate and a low false positive rate.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.knn, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+#ggplot(ROC_curve_plot)
+ROC_curve_plot
+predict(classifier.knn, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.knn, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the KNN model. For the 10 different ROC curves, we can even get a sense of the variation in ROC curves.
+
+```{r}
+ROC_curveS <- classifier.knn$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+We can measure the Precision and the Recall by the Precision-Recall (P-R) Curve . 
+
+Precision:
+
+\[ \frac{true \ positives}{ true \ positives +   false \ positives}\]
+
+Recall:
+
+\[ \frac{true \ positives}{ true \ positives +   false \ negatives}\]
+
+The ideal P-R curve hugs the top right corner, representing both high recall and high precision which indicates the model is returning accurate and positive results.
+
+```{r}
+PR_curve <- predict(classifier.knn, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the KNN model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.knn$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.knn.recall.mean <- get_metrics_func(out_of_folds_CM.knn, 'recall', mean)
+classifier.knn.recall.sd <- get_metrics_func(out_of_folds_CM.knn, 'recall', sd)
+
+classifier.knn.precision.mean <- get_metrics_func(out_of_folds_CM.knn, 'precision', mean)
+classifier.knn.precision.sd <- get_metrics_func(out_of_folds_CM.knn, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.knn.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.knn.recall.sd)`
+
+* Precision Mean: `r toString(classifier.knn.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.knn.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+$F_1$ score is more useful measure than accuracy for problems with uneven class distributions since $F_1$ is defined as :
+
+\[ F_1 = 2 * \frac{\frac{\Sigma \ True \ Positive}{\Sigma \ Predicted \ Condition \ Positive}*\frac{\Sigma True \ Positive}{\Sigma \ Condition \ Positive}}{\frac{\Sigma \ True \ Positive}{\Sigma \ Predicted \ Condition \ Positive}+\frac{\Sigma \ True \ Positive}{\Sigma \ Condition \ Positive}}\]
+
+it takes into account both false positive and false negatives. The optimal $F_1$ Score is between 0 and 1 with 1 meaning perfect precision and recall.
+
+```{r}
+preds <- predict(classifier.knn, type='prob')[,2]
+opt_thresh.knn <- get_optimal_threshold(classifier.knn)
+opt_thresh.knn
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.knn)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+
+Now using the optimal threshold we get:
+
+* True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.knn)`. 
+
+```{r}
+plot_folds_CM(classifier.knn,opt_thresh.knn)
+```
+
+## Summary Stats K Nearest Neighbor
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.knn, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.knn, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+knn.Accuracy = accuracy
+knn.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.knn$pred$obs,
+  pred = classifier.knn$pred$pred,
+  Down = classifier.knn$pred$Down, 
+  Up = classifier.knn$pred$Up), lev = levels(classifier.knn$pred$obs))
+
+knn.ROC = "TRUE" #unname(twoclassSum[1])
+knn.Threshold = opt_thresh.knn
+knn.Sensitivity = knn.Recall= knn.Power =  TPR
+knn.Specificity= 1-FPR
+knn.FDR = FDR
+knn.Precision=PPV
+```
+
+```{r}
+
+df = data.frame(c(knn.Accuracy, knn.AUC, knn.ROC, knn.Threshold, knn.Sensitivity, knn.Specificity, knn.FDR , knn.Precision))
+
+
+colnames(df) <- c(paste0("KNN (k =",bestk,")"))
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+
+# K-Folds Out of Sampling Performance: Linear Discriminant Analysis
+
+The next classification process that we used is the linear discriminant analysis (LDA). LDA assumes that the observations within each class are drawn from a multivariate Gaussian distribution with a class specific mean vector and a covariance matrix that is common to all K classes. Again, we’ll use the caret package in R to apply the LDA classification procedure using a 10 - Fold Cross-Validation evaluation procedure. 
+
+```{r caret LDA}
+set.seed(1)
+registerDoSEQ()
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.lda <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="lda",
+                               preProcess=c("center","scale"),
+                               #tuneGrid=data.frame(.dimen = seq(1,10,1)),#seq(1,1000,5)),
+                               trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                               returnResamp='all', savePredictions='final',
+                                                               classProbs=TRUE))
+```
+
+```{r}
+classifier.lda
+```
+
+
+```{r message=FALSE, warning=FALSE}
+classifier.lda$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.lda$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.lda,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.lda <- get_out_of_folds_CM(classifier.lda)
+classifier.lda.sensitivity.mean <- get_metrics_func(out_of_folds_CM.lda, 'sensitivity', mean)
+classifier.lda.sensitivity.sd <- get_metrics_func(out_of_folds_CM.lda, 'sensitivity', sd)
+
+classifier.lda.specificity.mean <- get_metrics_func(out_of_folds_CM.lda, 'specificity', mean)
+classifier.lda.specificity.sd <- get_metrics_func(out_of_folds_CM.lda, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.lda.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.lda.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.lda.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.lda.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.lda, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.lda, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.lda, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the LDA model. For the 10 different ROC curves, we can even get a sense of the variation in ROC curves.
+
+```{r}
+ROC_curveS <- classifier.lda$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.lda, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the LDA model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.lda$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.lda.recall.mean <- get_metrics_func(out_of_folds_CM.lda, 'recall', mean)
+classifier.lda.recall.sd <- get_metrics_func(out_of_folds_CM.lda, 'recall', sd)
+
+classifier.lda.precision.mean <- get_metrics_func(out_of_folds_CM.lda, 'precision', mean)
+classifier.lda.precision.sd <- get_metrics_func(out_of_folds_CM.lda, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.lda.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.lda.recall.sd)`
+
+* Precision Mean: `r toString(classifier.lda.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.lda.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.lda, type='prob')[,2]
+opt_thresh.lda <- get_optimal_threshold(classifier.lda)
+opt_thresh.lda
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.lda)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.lda)`. 
+
+```{r}
+plot_folds_CM(classifier.lda,opt_thresh.lda)
+```
+
+## Summary Stats LDA
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.lda, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.lda, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+lda.Accuracy = accuracy
+lda.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.lda$pred$obs,
+                                                 pred = classifier.lda$pred$pred,
+                                                 Down = classifier.lda$pred$Down, 
+                                                 Up = classifier.lda$pred$Up), lev = levels(classifier.lda$pred$obs))
+
+lda.ROC = "TRUE" #unname(twoclassSum[1])
+lda.Threshold = opt_thresh.lda
+lda.Sensitivity = lda.Recall= lda.Power =  TPR
+lda.Specificity= 1-FPR
+lda.FDR = FDR
+lda.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(lda.Accuracy, lda.AUC, lda.ROC, lda.Threshold, lda.Sensitivity, lda.Specificity, lda.FDR , lda.Precision))
+
+colnames(df) <- c("LDA")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Quadratic Discriminant Analysis
+
+The next classification process that we used is the quadratic discriminant analysis (qda). Like LDA, the QDA classifier results from assuming that the observations from each class are drawn from a Gaussian distribution, and plugging estimates for the parameters into Bayes’ theorem in order to perform prediction. Again, we’ll use the caret package in R to apply the qda classification procedure using a 10 - Fold Cross-Validation evaluation procedure.
+
+```{r caret QDA}
+set.seed(1)
+registerDoSEQ()
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.qda <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="qda",
+                               preProcess=c("center","scale"),
+                               #tuneGrid=data.frame(.dimen = seq(1,10,1)),#seq(1,1000,5)),
+                               trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                               returnResamp='all', savePredictions='final',
+                                                               classProbs=TRUE))
+```
+
+```{r}
+classifier.qda
+```
+
+
+```{r message=FALSE, warning=FALSE}
+classifier.qda$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.qda$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.qda,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.qda <- get_out_of_folds_CM(classifier.qda)
+classifier.qda.sensitivity.mean <- get_metrics_func(out_of_folds_CM.qda, 'sensitivity', mean)
+classifier.qda.sensitivity.sd <- get_metrics_func(out_of_folds_CM.qda, 'sensitivity', sd)
+
+classifier.qda.specificity.mean <- get_metrics_func(out_of_folds_CM.qda, 'specificity', mean)
+classifier.qda.specificity.sd <- get_metrics_func(out_of_folds_CM.qda, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.qda.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.qda.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.qda.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.qda.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.qda, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.qda, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.qda, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the qda model.
+
+```{r}
+ROC_curveS <- classifier.qda$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.qda, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the QDA model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.qda$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.qda.recall.mean <- get_metrics_func(out_of_folds_CM.qda, 'recall', mean)
+classifier.qda.recall.sd <- get_metrics_func(out_of_folds_CM.qda, 'recall', sd)
+
+classifier.qda.precision.mean <- get_metrics_func(out_of_folds_CM.qda, 'precision', mean)
+classifier.qda.precision.sd <- get_metrics_func(out_of_folds_CM.qda, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.qda.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.qda.recall.sd)`
+
+* Precision Mean: `r toString(classifier.qda.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.qda.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.qda, type='prob')[,2]
+opt_thresh.qda <- get_optimal_threshold(classifier.qda)
+opt_thresh.qda
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.qda)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.qda)`. 
+
+```{r}
+plot_folds_CM(classifier.qda,opt_thresh.qda)
+```
+
+## Summary Stats qda
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.qda, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.qda, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+qda.Accuracy = accuracy
+qda.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.qda$pred$obs,
+                                                 pred = classifier.qda$pred$pred,
+                                                 Down = classifier.qda$pred$Down, 
+                                                 Up = classifier.qda$pred$Up), lev = levels(classifier.qda$pred$obs))
+
+qda.ROC = "TRUE" #unname(twoclassSum[1])
+qda.Threshold = opt_thresh.qda
+qda.Sensitivity = qda.Recall= qda.Power =  TPR
+qda.Specificity= 1-FPR
+qda.FDR = FDR
+qda.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(qda.Accuracy, qda.AUC, qda.ROC, qda.Threshold, qda.Sensitivity, qda.Specificity, qda.FDR , qda.Precision))
+
+colnames(df) <- c("QDA")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Logistic Regression
+
+Our next classification process that we used is the linear discriminant analysis (glm). Again, we’ll use the caret package in R to apply the glm classification procedure using a 10 - Fold Cross-Validation evaluation procedure. 
+
+```{r caret glm, warning=FALSE}
+set.seed(1)
+registerDoSEQ()
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.glm <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="glm",
+                               preProcess=c("center","scale"),
+                               #tuneGrid=data.frame(.dimen = seq(1,10,1)),#seq(1,1000,5)),
+                               trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                               returnResamp='all', savePredictions='final',
+                                                               classProbs=TRUE))
+```
+
+```{r}
+classifier.glm
+```
+
+
+```{r message=FALSE, warning=FALSE}
+classifier.glm$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.glm$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.glm,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.glm <- get_out_of_folds_CM(classifier.glm)
+classifier.glm.sensitivity.mean <- get_metrics_func(out_of_folds_CM.glm, 'sensitivity', mean)
+classifier.glm.sensitivity.sd <- get_metrics_func(out_of_folds_CM.glm, 'sensitivity', sd)
+
+classifier.glm.specificity.mean <- get_metrics_func(out_of_folds_CM.glm, 'specificity', mean)
+classifier.glm.specificity.sd <- get_metrics_func(out_of_folds_CM.glm, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.glm.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.glm.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.glm.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.glm.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.glm, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.glm, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.glm, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the glm model.
+
+```{r}
+ROC_curveS <- classifier.glm$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.glm, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the logistic regression model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.glm$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.glm.recall.mean <- get_metrics_func(out_of_folds_CM.glm, 'recall', mean)
+classifier.glm.recall.sd <- get_metrics_func(out_of_folds_CM.glm, 'recall', sd)
+
+classifier.glm.precision.mean <- get_metrics_func(out_of_folds_CM.glm, 'precision', mean)
+classifier.glm.precision.sd <- get_metrics_func(out_of_folds_CM.glm, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.glm.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.glm.recall.sd)`
+
+* Precision Mean: `r toString(classifier.glm.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.glm.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.glm, type='prob')[,2]
+opt_thresh.glm <- get_optimal_threshold(classifier.glm)
+opt_thresh.glm
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.glm)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.glm)`. 
+
+```{r}
+plot_folds_CM(classifier.glm,opt_thresh.glm)
+```
+
+## Summary Stats glm
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.glm, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.glm, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+glm.Accuracy = accuracy
+glm.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.glm$pred$obs,
+                                                 pred = classifier.glm$pred$pred,
+                                                 Down = classifier.glm$pred$Down, 
+                                                 Up = classifier.glm$pred$Up), lev = levels(classifier.glm$pred$obs))
+
+glm.ROC = "TRUE" #unname(twoclassSum[1])
+glm.Threshold = opt_thresh.glm
+glm.Sensitivity = glm.Recall= glm.Power =  TPR
+glm.Specificity= 1-FPR
+glm.FDR = FDR
+glm.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(glm.Accuracy, glm.AUC, glm.ROC, glm.Threshold, glm.Sensitivity, glm.Specificity, glm.FDR , glm.Precision))
+
+colnames(df) <- c("Logistic Regression")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Random Forest
+
+A Random forests model uses a set of decision trees in a way that decorrelates the trees. Each individual tree will decide a class prediction and the largest total will decide the class that the observation belongs to.
+
+```{r}
+cl <- future::makeClusterPSOCK(4, outfile = NULL, verbose = FALSE)
+registerDoParallel(cl)
+```
+
+```{r caret Random Forest}
+set.seed(1)
+
+# Random Forest (method = 'rf')
+# For classification and regression using package randomForest with tuning parameters:
+# Number of Randomly Selected Predictors (mtry, numeric)
+classifier.rf <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="rf",
+                              preProcess=c("center","scale"),
+                              nodesize=5, importance=TRUE,
+                              tuneGrid=data.frame(mtry=1:(ncol(HaitiPixels)-1)),
+                              trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                              returnResamp='all', savePredictions='final',
+                                                              classProbs=TRUE))
+stopCluster(cl)
+```
+
+
+```{r}
+classifier.rf
+classifier.rf.bestMtry <- classifier.rf$bestTune$mtry
+classifier.rf.nTree <- classifier.rf$finalModel$ntree
+```
+
+The argument mtry indicates the number of predictors that should be considered for each split of the tree. Training across various values of mtry, we can see that our optimal mtry is `r toString(classifier.rf.bestMtry)`. The number of trees used was default `r toString(classifier.rf.nTree)` So we’ll proceed with the analysis using this value.
+
+```{r}
+classifier.rf %>% ggplot(aes(x=seq_along(Accuracy), y=Accuracy))
+```
+
+```{r message=FALSE, warning=FALSE}
+classifier.rf$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.rf$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.rf,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.rf <- get_out_of_folds_CM(classifier.rf)
+classifier.rf.sensitivity.mean <- get_metrics_func(out_of_folds_CM.rf, 'sensitivity', mean)
+classifier.rf.sensitivity.sd <- get_metrics_func(out_of_folds_CM.rf, 'sensitivity', sd)
+
+classifier.rf.specificity.mean <- get_metrics_func(out_of_folds_CM.rf, 'specificity', mean)
+classifier.rf.specificity.sd <- get_metrics_func(out_of_folds_CM.rf, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.rf.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.rf.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.rf.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.rf.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.rf, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.rf, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.rf, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the rf model.
+
+```{r}
+ROC_curveS <- classifier.rf$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.rf, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the Random Forest model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.rf$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.rf.recall.mean <- get_metrics_func(out_of_folds_CM.rf, 'recall', mean)
+classifier.rf.recall.sd <- get_metrics_func(out_of_folds_CM.rf, 'recall', sd)
+
+classifier.rf.precision.mean <- get_metrics_func(out_of_folds_CM.rf, 'precision', mean)
+classifier.rf.precision.sd <- get_metrics_func(out_of_folds_CM.rf, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.rf.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.rf.recall.sd)`
+
+* Precision Mean: `r toString(classifier.rf.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.rf.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.rf, type='prob')[,2]
+opt_thresh.rf <- get_optimal_threshold(classifier.rf)
+opt_thresh.rf
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.rf)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.rf)`. 
+
+```{r}
+plot_folds_CM(classifier.rf,opt_thresh.rf)
+```
+
+## Summary Stats Random Forest
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.rf, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.rf, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+rf.Accuracy = accuracy
+rf.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.rf$pred$obs,
+                                                 pred = classifier.rf$pred$pred,
+                                                 Down = classifier.rf$pred$Down, 
+                                                 Up = classifier.rf$pred$Up), lev = levels(classifier.rf$pred$obs))
+
+rf.ROC = "TRUE" #unname(twoclassSum[1])
+rf.Threshold = opt_thresh.rf
+rf.Sensitivity = rf.Recall= rf.Power =  TPR
+rf.Specificity= 1-FPR
+rf.FDR = FDR
+rf.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(rf.Accuracy, rf.AUC, rf.ROC, rf.Threshold, rf.Sensitivity, rf.Specificity, rf.FDR , rf.Precision))
+
+colnames(df) <- c(paste0("Random Forest ( mtry = ",classifier.rf.bestMtry,", ntree=",classifier.rf.nTree,")"))
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Support Vector Machines with Linear Kernel
+
+The support vector machine (SVM) is an extension of the support vector machine classifier that results from enlarging the feature space using kernels. The linear kernel takes the form of
+
+\[K(x_i,x_{i^\prime}) =\sum_{j=1}^{p}x_{ij}x_{{i^\prime}j}\]
+
+where the kernel quantifies the similarity of a pair of observations using Pearson correlation.
+
+
+```{r}
+cl <- future::makeClusterPSOCK(4, outfile = NULL, verbose = FALSE)
+registerDoParallel(cl)
+```
+
+```{r caret SVM Linear}
+set.seed(1)
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.svm.linear <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="svmLinear",
+                                      preProcess=c("center","scale"),
+                                      tuneGrid=data.frame(C=c(10^((-1):3))),
+                                      trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                                      returnResamp='all', savePredictions='final',
+                                                                      classProbs=TRUE))
+stopCluster(cl)
+```
+
+```{r}
+classifier.svm.linear
+classifier.svm.linear.bestC <- classifier.svm.linear$bestTune$C
+```
+
+We can compute the distance from each training observation to a given separating hyperplane and call this the margin. When the cost argument is small, then the margins will be wide and many support vectors will violate the margin. When the cost argument is large, then the margins will be narrow and there will be few support vectors violating the margin. The parameter C can be used as a budget for the amount that the margin can be violated by the n observations. Training across various values of Cost, we can see that our optimal C is `r toString(classifier.svm.linear.bestC)`.  So we’ll proceed with the analysis using this value.
+
+```{r}
+classifier.svm.linear %>% ggplot(aes(x=seq_along(Accuracy), y=Accuracy))
+```
+
+```{r message=FALSE, warning=FALSE}
+classifier.svm.linear$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.svm.linear$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.svm.linear,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.svm.linear <- get_out_of_folds_CM(classifier.svm.linear)
+classifier.svm.linear.sensitivity.mean <- get_metrics_func(out_of_folds_CM.svm.linear, 'sensitivity', mean)
+classifier.svm.linear.sensitivity.sd <- get_metrics_func(out_of_folds_CM.svm.linear, 'sensitivity', sd)
+
+classifier.svm.linear.specificity.mean <- get_metrics_func(out_of_folds_CM.svm.linear, 'specificity', mean)
+classifier.svm.linear.specificity.sd <- get_metrics_func(out_of_folds_CM.svm.linear, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.svm.linear.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.svm.linear.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.svm.linear.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.svm.linear.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.linear, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.svm.linear, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.svm.linear, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the SVM with Linear Kernel model.
+
+```{r}
+ROC_curveS <- classifier.svm.linear$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.svm.linear, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the SVM with Linear Kernel model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.svm.linear$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.svm.linear.recall.mean <- get_metrics_func(out_of_folds_CM.svm.linear, 'recall', mean)
+classifier.svm.linear.recall.sd <- get_metrics_func(out_of_folds_CM.svm.linear, 'recall', sd)
+
+classifier.svm.linear.precision.mean <- get_metrics_func(out_of_folds_CM.svm.linear, 'precision', mean)
+classifier.svm.linear.precision.sd <- get_metrics_func(out_of_folds_CM.svm.linear, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.svm.linear.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.svm.linear.recall.sd)`
+
+* Precision Mean: `r toString(classifier.svm.linear.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.svm.linear.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r Opt Thresh SVM Linear}
+preds <- predict(classifier.svm.linear, type='prob')[,2]
+opt_thresh.svm.linear <- get_optimal_threshold(classifier.svm.linear)
+opt_thresh.svm.linear
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.svm.linear)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.svm.linear)`. 
+
+```{r}
+plot_folds_CM(classifier.svm.linear,opt_thresh.svm.linear)
+```
+
+## Summary Stats SVM Linear
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.linear, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.linear, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+svm.linear.Accuracy = accuracy
+svm.linear.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.svm.linear$pred$obs,
+                                                 pred = classifier.svm.linear$pred$pred,
+                                                 Down = classifier.svm.linear$pred$Down, 
+                                                 Up = classifier.svm.linear$pred$Up), lev = levels(classifier.svm.linear$pred$obs))
+
+svm.linear.ROC = "TRUE" #unname(twoclassSum[1])
+svm.linear.Threshold = opt_thresh.svm.linear
+svm.linear.Sensitivity = svm.linear.Recall= svm.linear.Power =  TPR
+svm.linear.Specificity= 1-FPR
+svm.linear.FDR = FDR
+svm.linear.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(svm.linear.Accuracy, svm.linear.AUC, svm.linear.ROC, svm.linear.Threshold, svm.linear.Sensitivity, svm.linear.Specificity, svm.linear.FDR , svm.linear.Precision))
+
+
+colnames(df) <- c(paste0("SVM Linear ( Cost = ",classifier.svm.linear.bestC,")" ))
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Support Vector Machines with Radial Basis Function Kernel
+
+The radial kernel of the SVM takes the form 
+
+\[K(x_i,x_{i^\prime}) = exp(-\gamma\sum_{j=1}^{p}(x_{ij} - x_{{i^\prime}j})^2)\]
+
+
+```{r}
+cl <- future::makeClusterPSOCK(4, outfile = NULL, verbose = FALSE)
+registerDoParallel(cl)
+```
+
+```{r caret SVM Radial, warning=FALSE}
+set.seed(1)
+grid <- expand.grid(sigma = seq(0.8,1.8,.2),
+                    C = c(10^((2):6))
+)
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.svm.radial <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="svmRadial",
+                                      preProcess=c("center","scale"),
+                                      tuneGrid=grid,
+                                      trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                                      returnResamp='all', savePredictions='final',
+                                                                      classProbs=TRUE))
+stopCluster(cl)
+```
+
+```{r}
+classifier.svm.radial
+classifier.svm.radial.bestC <- classifier.svm.radial$bestTune$C
+classifier.svm.radial.bestSigma <- classifier.svm.radial$bestTune$sigma
+```
+
+Training across various values of Cost and Sigma, we can see that our optimal C is `r toString(classifier.svm.radial.bestC)` and our optimal sigma is `r toString(classifier.svm.radial.bestSigma)`.  So we’ll proceed with the analysis using this value.
+
+```{r}
+classifier.svm.radial %>% ggplot(aes(x=seq_along(Accuracy), y=Accuracy))
+```
+
+```{r message=FALSE, warning=FALSE}
+classifier.svm.radial$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.svm.radial$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.svm.radial,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.svm.radial <- get_out_of_folds_CM(classifier.svm.radial)
+classifier.svm.radial.sensitivity.mean <- get_metrics_func(out_of_folds_CM.svm.radial, 'sensitivity', mean)
+classifier.svm.radial.sensitivity.sd <- get_metrics_func(out_of_folds_CM.svm.radial, 'sensitivity', sd)
+
+classifier.svm.radial.specificity.mean <- get_metrics_func(out_of_folds_CM.svm.radial, 'specificity', mean)
+classifier.svm.radial.specificity.sd <- get_metrics_func(out_of_folds_CM.svm.radial, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.svm.radial.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.svm.radial.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.svm.radial.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.svm.radial.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.radial, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.svm.radial, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.svm.radial, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the SVM with Radial Kernel model.
+
+```{r}
+ROC_curveS <- classifier.svm.radial$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.svm.radial, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the SVM with Radial Kernel model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.svm.radial$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.svm.radial.recall.mean <- get_metrics_func(out_of_folds_CM.svm.radial, 'recall', mean)
+classifier.svm.radial.recall.sd <- get_metrics_func(out_of_folds_CM.svm.radial, 'recall', sd)
+
+classifier.svm.radial.precision.mean <- get_metrics_func(out_of_folds_CM.svm.radial, 'precision', mean)
+classifier.svm.radial.precision.sd <- get_metrics_func(out_of_folds_CM.svm.radial, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.svm.radial.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.svm.radial.recall.sd)`
+
+* Precision Mean: `r toString(classifier.svm.radial.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.svm.radial.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.svm.radial, type='prob')[,2]
+opt_thresh.svm.radial <- get_optimal_threshold(classifier.svm.radial)
+opt_thresh.svm.radial
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.svm.radial)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+* True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.svm.radial)`. 
+
+```{r}
+plot_folds_CM(classifier.svm.radial,opt_thresh.svm.radial)
+```
+
+## Summary Stats SVM Radial
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.radial, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.radial, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+svm.radial.Accuracy = accuracy
+svm.radial.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.svm.radial$pred$obs,
+                                                 pred = classifier.svm.radial$pred$pred,
+                                                 Down = classifier.svm.radial$pred$Down, 
+                                                 Up = classifier.svm.radial$pred$Up), lev = levels(classifier.svm.radial$pred$obs))
+
+svm.radial.ROC = "TRUE" #unname(twoclassSum[1])
+svm.radial.Threshold = opt_thresh.svm.radial
+svm.radial.Sensitivity = svm.radial.Recall= svm.radial.Power =  TPR
+svm.radial.Specificity= 1-FPR
+svm.radial.FDR = FDR
+svm.radial.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(svm.radial.Accuracy, svm.radial.AUC, svm.radial.ROC, svm.radial.Threshold, svm.radial.Sensitivity, svm.radial.Specificity, svm.radial.FDR , svm.radial.Precision))
+
+colnames(df) <- c(paste0("SVM Radial ( Cost = ",classifier.svm.radial.bestC,", Sigma = ",classifier.svm.radial.bestSigma ,")" ))
+
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Support Vector Machines with Polynomial Kernel
+
+The polynomial kernel of the SVM takes the form of
+
+\[K(x_i,x_{i^\prime}) =( 1+\sum_{j=1}^{p}x_{ij}x_{{i^\prime}j})^d\]
+
+
+```{r}
+cl <- future::makeClusterPSOCK(4, outfile = NULL, verbose = FALSE)
+registerDoParallel(cl)
+```
+
+```{r caret SVM Polynomial, warning=FALSE}
+set.seed(1)
+grid <- expand.grid(scale = seq(0.6,1.2,0.2),
+                    C = c(10^((2):4)),
+                    degree = seq(4,6,1)
+)
+# https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+classifier.svm.poly <- caret::train(BlueTarp_rest ~ Red + Green + Blue, data=train, method="svmPoly",
+                                    preProcess=c("center","scale"),
+                                    tuneGrid=grid,
+                                    trControl = caret::trainControl("cv", number=kfoldcv, 
+                                                                    returnResamp='all', savePredictions='final',
+                                                                    classProbs=TRUE))
+stopCluster(cl)
+```
+
+```{r}
+classifier.svm.poly
+classifier.svm.poly.bestC <- classifier.svm.poly$bestTune$C
+classifier.svm.poly.bestDegree <- classifier.svm.poly$bestTune$degree
+classifier.svm.poly.bestScale <- classifier.svm.poly$bestTune$scale
+```
+
+Training across various values of Cost, Degree and Scale, we can see that our optimal C is `r toString(classifier.svm.poly.bestC)`, our optimal Degree is `r toString(classifier.svm.poly.bestDegree)` and our optimal Scale is `r toString(classifier.svm.poly.bestScale)`.  So we’ll proceed with the analysis using this value.
+
+We can look at the various plots of Scale vs Accuracy for various Cost and Polynomial degree.
+
+```{r}
+classifier.svm.poly %>% ggplot(aes(x=seq_along(Accuracy), y=Accuracy))
+```
+
+```{r message=FALSE, warning=FALSE}
+classifier.svm.poly$resample %>% 
+  dplyr::group_split(Resample) %>% 
+  purrr::map(rowid_to_column) %>%
+  dplyr::bind_rows() %>%
+  ggplot(aes(rowid, Accuracy)) + geom_point() +
+  geom_smooth(formula='y~x', method='loess', span=.03) +
+  geom_line(classifier.svm.poly$results, mapping=aes(seq_along(Accuracy), Accuracy),
+            size=2, color='red')
+```
+
+## Confusion Matrix
+
+Next we'll look at the Confusion Matrix from the model.
+
+```{r warning=FALSE}
+# confusionMatrix
+THRESHOLD <- 0.5
+plot_folds_CM(classifier.svm.poly,THRESHOLD)
+```
+
+```{r}
+out_of_folds_CM.svm.poly <- get_out_of_folds_CM(classifier.svm.poly)
+classifier.svm.poly.sensitivity.mean <- get_metrics_func(out_of_folds_CM.svm.poly, 'sensitivity', mean)
+classifier.svm.poly.sensitivity.sd <- get_metrics_func(out_of_folds_CM.svm.poly, 'sensitivity', sd)
+
+classifier.svm.poly.specificity.mean <- get_metrics_func(out_of_folds_CM.svm.poly, 'specificity', mean)
+classifier.svm.poly.specificity.sd <- get_metrics_func(out_of_folds_CM.svm.poly, 'specificity', sd)
+```
+
+Reviewing the confusion matrix, we have:
+  
+* Sensitivity Mean: `r toString(classifier.svm.poly.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.svm.poly.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.svm.poly.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.svm.poly.specificity.sd)`
+
+## Receiver Operating Characteristic Curve
+
+Next we'll look at the ROC curve.
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.poly, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+predict(classifier.svm.poly, type='prob') %>% 
+  yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+```
+
+
+```{r}
+ROC_curve %>% head()
+predict(classifier.svm.poly, type='prob') %>% head()
+```
+
+We can also look at each ROC curve from each fold from the SVM with Polynomial Kernel model.
+
+```{r}
+ROC_curveS <- classifier.svm.poly$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::roc_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ dplyr::mutate(.x, one_minus_specificity = 1-specificity)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(one_minus_specificity, sensitivity)))
+
+ROC_curveS[[1]] <- ggplot() + ROC_curveS[[1]]
+Reduce("+", ROC_curveS) + 
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC Curves')
+```
+
+## Precision-Recall Curve
+
+Next, we'll look at the P-R curve.
+
+```{r}
+PR_curve <- predict(classifier.svm.poly, type='prob') %>% 
+  yardstick::pr_curve(truth=train$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+We can also look at each P-R curve from each fold from the SVM with Polynomial Kernel model. For the 10 different P-R curves, we can even get a sense of the variation in P-R curves.
+
+```{r}
+PR_curveS <- classifier.svm.poly$pred %>%
+  dplyr::group_split(Resample) %>% 
+  purrr::map(~ yardstick::pr_curve(.x, truth=obs, Up)) %>%
+  purrr::map(~ geom_line(.x, mapping=aes(recall, precision)))
+
+PR_curveS[[1]] <- ggplot() + PR_curveS[[1]]
+Reduce("+", PR_curveS) + 
+  #geom_abline(slope=-1, intercept=1, linetype='dashed', color='red') +
+  #xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('Precision Recall Curves')
+```
+
+```{r}
+classifier.svm.poly.recall.mean <- get_metrics_func(out_of_folds_CM.svm.poly, 'recall', mean)
+classifier.svm.poly.recall.sd <- get_metrics_func(out_of_folds_CM.svm.poly, 'recall', sd)
+
+classifier.svm.poly.precision.mean <- get_metrics_func(out_of_folds_CM.svm.poly, 'precision', mean)
+classifier.svm.poly.precision.sd <- get_metrics_func(out_of_folds_CM.svm.poly, 'precision', sd)
+```
+
+* Recall Mean: `r toString(classifier.svm.poly.recall.mean)`
+
+* Recall Standard Deviation: `r toString(classifier.svm.poly.recall.sd)`
+
+* Precision Mean: `r toString(classifier.svm.poly.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.svm.poly.precision.sd)`
+
+To find the optimal threshold, well look at using the $F_1$ Score.
+
+```{r}
+preds <- predict(classifier.svm.poly, type='prob')[,2]
+opt_thresh.svm.poly <- get_optimal_threshold(classifier.svm.poly)
+opt_thresh.svm.poly
+```
+
+```{r}
+yhat <- tuned_call(preds, opt_thresh.svm.poly)
+one_minus_specificity <- mean(yhat[y=='Down']=='Up')
+sensitivity <- mean(yhat[y=='Up']=='Up')
+one_minus_specificity
+sensitivity
+results <- tibble::tibble(y=y, yhat=yhat)
+
+caret::confusionMatrix(yhat, y, positive = "Up") 
+cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+
+trueNegative  = cm$table[1,1]
+falseNegative = cm$table[1,2]
+falsePositive = cm$table[2,1]
+truePositve   = cm$table[2,2]
+
+conditionPositive = truePositve + falseNegative
+conditionNegative = trueNegative + falsePositive 
+predictedConditionPositive = truePositve +  falsePositive 
+predictedConditionNegative = trueNegative + falseNegative
+
+TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+prevalence = conditionPositive / TotalPopulation
+accuracy = (truePositve + trueNegative) / TotalPopulation
+PPV = truePositve / predictedConditionPositive
+FDR = falsePositive / predictedConditionPositive
+FOR = falseNegative / predictedConditionNegative
+NPV = trueNegative / predictedConditionNegative
+TPR = truePositve / conditionPositive
+FPR = falsePositive / conditionNegative
+FNR = falseNegative / conditionPositive
+SPC = TNR = trueNegative / conditionNegative
+LR.PLUS = TPR / FPR
+LR.MINUS = FNR/TNR
+DOR = LR.PLUS / LR.MINUS
+
+F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+```
+
+Now using the optimal threshold we get:
+  
+ * True Negative = `r toString(trueNegative )`
+
+* False Negative = `r toString(falseNegative)`
+
+* False Positive = `r toString(falsePositive)`
+
+* True Positive = `r toString(truePositve)`
+
+* Condition Positive = `r toString(conditionPositive)`
+
+* condition Negative = `r toString(conditionNegative)`
+
+* Predicted Condition Positive = `r toString(predictedConditionPositive)`
+
+* Predicted Condition Negative = `r toString(predictedConditionNegative)`
+
+* Total Population = `r toString(TotalPopulation)`
+
+* Prevalence = `r toString(prevalence)`
+
+* Accuracy = `r toString(accuracy)`
+
+* Positive predictive value, precision = `r toString(PPV)`
+
+* False Discovery rate = `r toString(FDR)`
+
+* False Omission Rate = `r toString(FOR)`
+
+* Negative Predictive Value = `r toString(NPV)`
+
+* True Positive Rate, Recall, Sensitivity = `r toString(TPR)`
+
+* False Positive Rate = `r toString(FPR)`
+
+* False Negative Rate = `r toString(FNR)`
+
+* Specificity, Selectivity, True Negative rate = `r toString(SPC)`
+
+* Positive likelihood ratio = `r toString(LR.PLUS)`
+
+* Negative likelihood ratio = `r toString(LR.MINUS)`
+
+* Diagnostic Odds Ratio = `r toString(DOR)`
+
+* $F_1$ Score  = `r toString(F_1_score)`
+
+From our plot we selected our optimal threshold as `r toString(opt_thresh.svm.poly)`. 
+
+```{r}
+plot_folds_CM(classifier.svm.poly,opt_thresh.svm.poly)
+```
+
+## Summary Stats SVM Poly
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.poly, type='prob') %>% 
+  yardstick::roc_curve(truth=train$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.poly, type='prob') %>% yardstick::roc_auc(truth=train$BlueTarp_rest, Up) 
+
+svm.poly.Accuracy = accuracy
+svm.poly.AUC = temp$.estimate
+
+twoclassSum = twoClassSummary( data = data.frame(obs = classifier.svm.poly$pred$obs,
+                                                 pred = classifier.svm.poly$pred$pred,
+                                                 Down = classifier.svm.poly$pred$Down, 
+                                                 Up = classifier.svm.poly$pred$Up), lev = levels(classifier.svm.poly$pred$obs))
+
+svm.poly.ROC = "TRUE" #unname(twoclassSum[1])
+svm.poly.Threshold = opt_thresh.svm.poly
+svm.poly.Sensitivity = svm.poly.Recall= svm.poly.Power =  TPR
+svm.poly.Specificity= 1-FPR
+svm.poly.FDR = FDR
+svm.poly.Precision=PPV
+```
+
+```{r}
+df = data.frame(c(svm.poly.Accuracy, svm.poly.AUC, svm.poly.ROC, svm.poly.Threshold, svm.poly.Sensitivity, svm.poly.Specificity, svm.poly.FDR , svm.poly.Precision))
+
+colnames(df) <- c(paste0("SVM Polynomial ( Cost = ",classifier.svm.poly.bestC,", Degree = ",classifier.svm.poly.bestDegree , ", Scale = ",classifier.svm.poly.bestScale,")" ))
+
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# K-Folds Out of Sampling Performance: Table 2
+
+```{r}
+
+df = data.frame(c(knn.Accuracy, knn.AUC, knn.ROC, knn.Threshold, knn.Sensitivity, knn.Specificity, knn.FDR , knn.Precision),
+                c(lda.Accuracy, lda.AUC, lda.ROC, lda.Threshold, lda.Sensitivity, lda.Specificity, lda.FDR , lda.Precision),
+                c(qda.Accuracy, qda.AUC, qda.ROC, qda.Threshold, qda.Sensitivity, qda.Specificity, qda.FDR , qda.Precision), 
+                c(glm.Accuracy, glm.AUC, glm.ROC, glm.Threshold, glm.Sensitivity, glm.Specificity, glm.FDR , glm.Precision))
+
+
+colnames(df) <- c(paste0("KNN (k =",bestk,")"), "LDA","QDA","Logistic Regression")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+
+df = data.frame(c(rf.Accuracy, rf.AUC, rf.ROC, rf.Threshold, rf.Sensitivity, rf.Specificity, rf.FDR , rf.Precision),
+                c(svm.linear.Accuracy, svm.linear.AUC, svm.linear.ROC, svm.linear.Threshold, svm.linear.Sensitivity, svm.linear.Specificity, svm.linear.FDR , svm.linear.Precision),
+                c(svm.radial.Accuracy, svm.radial.AUC, svm.radial.ROC, svm.radial.Threshold, svm.radial.Sensitivity, svm.radial.Specificity, svm.radial.FDR , svm.radial.Precision), 
+                c(svm.poly.Accuracy, svm.poly.AUC, svm.poly.ROC, svm.poly.Threshold, svm.poly.Sensitivity, svm.poly.Specificity, svm.poly.FDR , svm.poly.Precision))
+
+
+colnames(df) <- c(paste0("Random Forest ( mtry = ",classifier.rf.bestMtry,", ntree=",classifier.rf.nTree,")")
+, paste0("SVM Linear ( Cost = ",classifier.svm.linear.bestC,")" ),paste0("SVM Radial ( Cost = ",classifier.svm.radial.bestC,", Sigma = ",classifier.svm.radial.bestSigma ,")" )
+,paste0("SVM Polynomial ( Cost = ",classifier.svm.poly.bestC,", Degree = ",classifier.svm.poly.bestDegree , ", Scale = ",classifier.svm.poly.bestScale,")" ))
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Hold-Out Test Sample Performance: K-Nearest Neighbors
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.knn, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.knn.Threshold = min(c(knn.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.knn.ROC = "TRUE"
+
+statistics = stat_fho(classifier.knn, fho, fho.knn.Threshold)
+
+fho.knn.accuracy = statistics[1]
+fho.knn.sensitivity = statistics[2]
+fho.knn.specificity = statistics[3]
+fho.knn.FDR = statistics[4]
+fho.knn.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.knn.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.knn, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.knn, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.knn.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.knn, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.knn.accuracy, fho.knn.AUC, fho.knn.ROC, fho.knn.Threshold, fho.knn.sensitivity, fho.knn.specificity, fho.knn.FDR , fho.knn.precision))
+
+colnames(df) <- c("FHO KNN")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Linear Discriminant Analysis
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.lda, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.lda.Threshold = min(c(lda.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.lda.ROC = "TRUE"
+
+statistics = stat_fho(classifier.lda, fho, fho.lda.Threshold)
+
+fho.lda.accuracy = statistics[1]
+fho.lda.sensitivity = statistics[2]
+fho.lda.specificity = statistics[3]
+fho.lda.FDR = statistics[4]
+fho.lda.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.lda.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.lda, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.lda, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.lda.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.lda, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.lda.accuracy, fho.lda.AUC, fho.lda.ROC, fho.lda.Threshold, fho.lda.sensitivity, fho.lda.specificity, fho.lda.FDR , fho.lda.precision))
+
+colnames(df) <- c("FHO LDA")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Quadratic Discriminant Analysis
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.qda, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.qda.Threshold = min(c(qda.Threshold,thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.qda.ROC = "TRUE"
+
+statistics = stat_fho(classifier.qda, fho, fho.qda.Threshold)
+
+fho.qda.accuracy = statistics[1]
+fho.qda.sensitivity = statistics[2]
+fho.qda.specificity = statistics[3]
+fho.qda.FDR = statistics[4]
+fho.qda.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.qda.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.qda, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.qda, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.qda.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.qda, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.qda.accuracy, fho.qda.AUC, fho.qda.ROC, fho.qda.Threshold, fho.qda.sensitivity, fho.qda.specificity, fho.qda.FDR , fho.qda.precision))
+
+colnames(df) <- c("FHO QDA")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Logistic Regression
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.glm, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.glm.Threshold = min(c(glm.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.glm.ROC = "TRUE"
+
+statistics = stat_fho(classifier.glm, fho, fho.glm.Threshold)
+
+fho.glm.accuracy = statistics[1]
+fho.glm.sensitivity = statistics[2]
+fho.glm.specificity = statistics[3]
+fho.glm.FDR = statistics[4]
+fho.glm.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.glm.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.glm, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.glm, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.glm.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.glm, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.glm.accuracy, fho.glm.AUC, fho.glm.ROC, fho.glm.Threshold, fho.glm.sensitivity, fho.glm.specificity, fho.glm.FDR , fho.glm.precision))
+
+colnames(df) <- c("FHO Logistic Regression ")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Random Forest
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.rf, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.rf.Threshold = min(c(rf.Threshold,thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.rf.ROC = "TRUE"
+
+statistics = stat_fho(classifier.rf, fho, fho.rf.Threshold)
+
+fho.rf.accuracy = statistics[1]
+fho.rf.sensitivity = statistics[2]
+fho.rf.specificity = statistics[3]
+fho.rf.FDR = statistics[4]
+fho.rf.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.rf.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.rf, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.rf, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.rf.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.rf, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.rf.accuracy, fho.rf.AUC, fho.rf.ROC, fho.rf.Threshold, fho.rf.sensitivity, fho.rf.specificity, fho.rf.FDR , fho.rf.precision))
+
+colnames(df) <- c("FHO Random Forest")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Support Vector Machines with Linear Kernel
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.svm.linear, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.svm.linear.Threshold = min(c(svm.linear.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.svm.linear.ROC = "TRUE"
+
+statistics = stat_fho(classifier.svm.linear, fho, fho.svm.linear.Threshold)
+
+fho.svm.linear.accuracy = statistics[1]
+fho.svm.linear.sensitivity = statistics[2]
+fho.svm.linear.specificity = statistics[3]
+fho.svm.linear.FDR = statistics[4]
+fho.svm.linear.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.svm.linear.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.linear, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.linear, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.svm.linear.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.svm.linear, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.svm.linear.accuracy, fho.svm.linear.AUC, fho.svm.linear.ROC, fho.svm.linear.Threshold, fho.svm.linear.sensitivity, fho.svm.linear.specificity, fho.svm.linear.FDR , fho.svm.linear.precision))
+
+colnames(df) <- c("FHO SVM w/ Linear")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Support Vector Machines with Radial Basis Function Kernel
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.svm.radial, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.svm.radial.Threshold = min(c(svm.radial.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.svm.radial.ROC = "TRUE"
+
+statistics = stat_fho(classifier.svm.radial, fho, fho.svm.radial.Threshold)
+
+fho.svm.radial.accuracy = statistics[1]
+fho.svm.radial.sensitivity = statistics[2]
+fho.svm.radial.specificity = statistics[3]
+fho.svm.radial.FDR = statistics[4]
+fho.svm.radial.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.svm.radial.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.radial, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.radial, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.svm.radial.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.svm.radial, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.svm.radial.accuracy, fho.svm.radial.AUC, fho.svm.radial.ROC, fho.svm.radial.Threshold, fho.svm.radial.sensitivity, fho.svm.radial.specificity, fho.svm.radial.FDR , fho.svm.radial.precision))
+
+colnames(df) <- c("FHO SVM w/ Radial")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Support Vector Machines with Polynomial Kernel
+
+```{r}
+y <- fho$BlueTarp_rest
+preds <- predict(classifier.svm.poly, newdata = fho, type = "prob")[,2]
+yhat <- tuned_call(preds, 0.5)
+caret::confusionMatrix(yhat, y, positive = "Up") 
+
+thresholds = seq(0.001,0.499,.001) # Avoid Threshold Tails
+F_1_scores <- rep(NA, length(thresholds))
+for (i in 1:length(thresholds)){
+  yhat <- tuned_call(preds, thresholds[i])
+  results <- tibble::tibble(y=y, yhat=yhat)
+  cm <- results %>%yardstick::conf_mat(truth=y, yhat)
+  
+  trueNegative  = cm$table[1,1]
+  falseNegative = cm$table[1,2]
+  falsePositive = cm$table[2,1]
+  truePositve   = cm$table[2,2]
+  
+  conditionPositive = truePositve + falseNegative
+  conditionNegative = trueNegative + falsePositive 
+  predictedConditionPositive = truePositve +  falsePositive 
+  predictedConditionNegative = trueNegative + falseNegative
+  
+  TotalPopulation = truePositve + falsePositive + trueNegative + falseNegative
+  
+  PPV = truePositve / predictedConditionPositive
+  TPR = truePositve / conditionPositive
+  
+  F_1_score = 2 * ((PPV * TPR)/(PPV + TPR))
+  F_1_scores[i] <- F_1_score
+}
+
+#plot(thresholds, F_1_scores, xlab = 'Thresholds', ylab = 'F1 Score', type = 'l')
+fho.svm.poly.Threshold = min(c(svm.poly.Threshold, thresholds[tail(which(na.omit(F_1_scores) == max(na.omit(F_1_scores))), n=1)]))
+fho.svm.poly.ROC = "TRUE"
+
+statistics = stat_fho(classifier.svm.poly, fho, fho.svm.poly.Threshold)
+
+fho.svm.poly.accuracy = statistics[1]
+fho.svm.poly.sensitivity = statistics[2]
+fho.svm.poly.specificity = statistics[3]
+fho.svm.poly.FDR = statistics[4]
+fho.svm.poly.precision = statistics[5]
+
+yhat <- tuned_call(preds, fho.svm.poly.Threshold)
+caret::confusionMatrix(yhat, y, positive = "Up")
+
+```
+
+## Receiver Operating Characteristic Curve
+
+```{r}
+options(yardstick.event_first = FALSE)
+ROC_curve <- predict(classifier.svm.poly, fho, type='prob') %>% 
+  yardstick::roc_curve(truth=fho$BlueTarp_rest, estimate=Up) %>%
+  dplyr::mutate(one_minus_specificity = 1-specificity)
+
+# Sensitivity: TP/(TP+FN)
+# 1-Specificity: FP/(TN+FP)
+
+ROC_curve_plot <- ROC_curve %>%
+  ggplot(aes(x=one_minus_specificity, y=sensitivity)) + 
+  geom_line() + geom_point() +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  xlab("one_minus_specificity\n(false positive rate)") +
+  ggtitle('ROC curve')
+
+ROC_curve_plot
+
+temp = predict(classifier.svm.poly, fho, type='prob') %>% 
+  yardstick::roc_auc(truth=fho$BlueTarp_rest, Up) 
+
+fho.svm.poly.AUC = temp$.estimate
+
+```
+
+## Precision-Recall Curve
+
+```{r}
+PR_curve <- predict(classifier.svm.poly, fho, type='prob') %>% 
+  yardstick::pr_curve(truth=fho$BlueTarp_rest, estimate=Up)
+
+PR_curve_plot <- PR_curve %>%
+  ggplot(aes(x=recall, y=precision)) + 
+  geom_line() + geom_point() +
+  #geom_abline(slope=0, intercept=0.5, linetype='dashed', color='red') +
+  ggtitle('Precision Recall Curve')
+
+PR_curve_plot
+```
+
+## Summary
+
+```{r}
+df = data.frame(c(fho.svm.poly.accuracy, fho.svm.poly.AUC, fho.svm.poly.ROC, fho.svm.poly.Threshold, fho.svm.poly.sensitivity, fho.svm.poly.specificity, fho.svm.poly.FDR , fho.svm.poly.precision))
+
+colnames(df) <- c("FHO SVM w/ Polynomial")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling()
+```
+
+# Hold-Out Test Sample Performance: Table 3
+
+```{r}
+
+df = data.frame(c(fho.knn.accuracy, fho.knn.AUC, fho.knn.ROC, fho.knn.Threshold, fho.knn.sensitivity, fho.knn.specificity, fho.knn.FDR , fho.knn.precision),
+                c(fho.lda.accuracy, fho.lda.AUC, fho.lda.ROC, fho.lda.Threshold, fho.lda.sensitivity, fho.lda.specificity, fho.lda.FDR , fho.lda.precision),
+                c(fho.qda.accuracy, fho.qda.AUC, fho.qda.ROC, fho.qda.Threshold, fho.qda.sensitivity, fho.qda.specificity, fho.qda.FDR , fho.qda.precision)
+, 
+                c(fho.glm.accuracy, fho.glm.AUC, fho.glm.ROC, fho.glm.Threshold, fho.glm.sensitivity, fho.glm.specificity, fho.glm.FDR , fho.glm.precision)
+)
+
+
+colnames(df) <- c("FHO KNN" , "FHO LDA","FHO QDA","FHO Logistic Regression")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+
+df = data.frame(c(fho.rf.accuracy, fho.rf.AUC, fho.rf.ROC, fho.rf.Threshold, fho.rf.sensitivity, fho.rf.specificity, fho.rf.FDR , fho.rf.precision),
+                c(fho.svm.linear.accuracy, fho.svm.linear.AUC, fho.svm.linear.ROC, fho.svm.linear.Threshold, fho.svm.linear.sensitivity, fho.svm.linear.specificity, fho.svm.linear.FDR , fho.svm.linear.precision)
+,
+                c(fho.svm.radial.accuracy, fho.svm.radial.AUC, fho.svm.radial.ROC, fho.svm.radial.Threshold, fho.svm.radial.sensitivity, fho.svm.radial.specificity, fho.svm.radial.FDR , fho.svm.radial.precision)
+, 
+                c(fho.svm.poly.accuracy, fho.svm.poly.AUC, fho.svm.poly.ROC, fho.svm.poly.Threshold, fho.svm.poly.sensitivity, fho.svm.poly.specificity, fho.svm.poly.FDR , fho.svm.poly.precision))
+
+
+colnames(df) <- c("FHO Random Forest","FHO SVM Linear","FHO SVM Radial","FHO SVM Polynomial")
+rownames(df) <- c("Accuracy","AUC", "ROC", "Threshold","Sensitivity=Recall=Power","Specificity=1-FPR","FDR","Precision=PPV")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Conclusions
+
+When taking an approach to select an optimal model, by using all of the data within HaitiPixels for the model generation, their respective  performances can be measured fairly accurately. Across all the algorithms, it's worth noting the time it takes to generate each model and should be taken into account when deciding which approach to take. Using a 10-Fold cross validation within the caret package, we get the following timings:
+
+```{r}
+timing <- c(classifier.knn$times$everything[3],
+            classifier.lda$times$everything[3],
+            classifier.qda$times$everything[3],
+            classifier.glm$times$everything[3],
+            classifier.rf$times$everything[3],
+            classifier.svm.linear$times$everything[3],
+            classifier.svm.radial$times$everything[3],
+            classifier.svm.poly$times$everything[3])
+
+df = data.frame(timing)
+colnames(df) <- c( "Elapsed Time (seconds)")
+rownames(df) <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+We can see some models have longer elapsed run times but this is a necessary cost since we want to avoid taking data from the model training data set. Using the full set will strengthen our model. We used the $F_1$ scores at different thresholds since it can be used to measure the performance of the unbalanced classification data set to determine the value of the metrics used in this analysis.
+
+The metrics we calculated for this application was precision, a measure of how precise the models are; recall, the total of actual positives; accuracy, the number of correct predictions over total number of predictions; false discovery rate, the rate of Type I errors; and specificity, the ratio of negatives that are correctly identified. As the observations are a matter of providing support and supplies to those in need, we can say that a greater emphasis is placed on a higher sensitivity and lower false discovery rate. In doing so, you're stating that all blue tarps are correctly identity and no blue tarps are not incorrectly identified as a non-blue tarp. 
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+accuracy.ranks <- c(knn.Accuracy,lda.Accuracy,qda.Accuracy,glm.Accuracy,rf.Accuracy,svm.linear.Accuracy,svm.radial.Accuracy,svm.poly.Accuracy)
+
+auc.ranks <- c(knn.AUC,lda.AUC,qda.AUC,glm.AUC,rf.AUC,svm.linear.AUC,svm.radial.AUC,svm.poly.AUC)
+
+sensitivity.ranks <- c(knn.Sensitivity,lda.Sensitivity,qda.Sensitivity,glm.Sensitivity,rf.Sensitivity,svm.linear.Sensitivity,svm.radial.Sensitivity,svm.poly.Sensitivity)
+
+specificity.ranks <- c(knn.Specificity,lda.Specificity,qda.Specificity,glm.Specificity,rf.Specificity,svm.linear.Specificity,svm.radial.Specificity,svm.poly.Specificity)
+
+fdr.ranks <- c(knn.FDR, lda.FDR,qda.FDR,glm.FDR,rf.FDR,svm.linear.FDR,svm.radial.FDR,svm.poly.FDR)
+
+precision.ranks <- c(knn.Precision, lda.Precision,qda.Precision,glm.Precision,rf.Precision,svm.linear.Precision,svm.radial.Precision,svm.poly.Precision)
+
+i1 <- sort(accuracy.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i2 <- sort(auc.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i3 <- sort(sensitivity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i4 <- sort(specificity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i5 <- sort(fdr.ranks, index.return=TRUE, decreasing = FALSE)$ix
+i6 <- sort(precision.ranks, index.return=TRUE, decreasing = TRUE)$ix
+
+myString = paste0("If we look at the statistics provided and ordering the models by accuracy, the best model is the ",name.ranks[i1][1], " with an accuracy of ", format(round(accuracy.ranks[i1][1], 6), nsmall = 6)," followed by ", name.ranks[i1][2], " with an accuracy of ",format(round(accuracy.ranks[i1][2], 6), nsmall = 6), " and ", name.ranks[i1][3], " with an accuracy of ",format(round(accuracy.ranks[i1][3], 6), nsmall = 6),". ","AUC, or Area Under Curve, is a measure of performance across all possible classification thresholds. Lowering the classification threshold classifies more items as positive. As such, you’ll want a model with a high AUC value. Ordering the models by AUC, the best model is the ", name.ranks[i2][1], " with an AUC of ", format(round(auc.ranks[i2][1], 6), nsmall = 6), " followed by ", name.ranks[i2][2], " with an AUC of ", format(round(auc.ranks[i2][2], 6), nsmall = 6), " and ", name.ranks[i2][3], " with an AUC of ", format(round(auc.ranks[i2][3], 6), nsmall = 6), ". ","Ordering the models by sensitivity, the best model is the ", name.ranks[i3][1], " with a sensitivity of ", format(round(sensitivity.ranks[i3][1], 6), nsmall = 6), " followed by ", name.ranks[i3][2], " with a sensitivity of ", format(round(sensitivity.ranks[i3][2], 6), nsmall = 6), " and ", name.ranks[i3][3], " with a sensitivity of ", format(round(sensitivity.ranks[i3][3], 6), nsmall = 6), ". ","Ordering the models by specificity, the best model is the ", name.ranks[i4][1], " with a specificity of ", format(round(specificity.ranks[i4][1], 6), nsmall = 6), " followed by ", name.ranks[i4][2], " with a specificity of ", format(round(specificity.ranks[i4][2], 6), nsmall = 6), " and ", name.ranks[i4][3], " with a specificity of ", format(round(specificity.ranks[i4][3], 6), nsmall = 6), ". ","The False Discovery Rate (FDR) is the expected proportion of type I errors ( you get a false positive ). The optimal model is one with a minimum value for FDR. The best model is the ", name.ranks[i5][1], " with a FDR of ", format(round(fdr.ranks[i5][1], 6), nsmall = 6), " followed by ", name.ranks[i5][2], " with a FDR of ", format(round(fdr.ranks[i5][2], 6), nsmall = 6), " and ", name.ranks[i5][3], " with a FDR of ", format(round(fdr.ranks[i5][3], 6), nsmall = 6), ". ","Lastly, you'll want a higher value for precision. Ordering the models by precision, the best model is the ", name.ranks[i6][1], " with a precision of ", format(round(precision.ranks[i6][1], 6), nsmall = 6), " followed by ", name.ranks[i6][2], " with a precision of ", format(round(precision.ranks[i6][2], 6), nsmall = 6), " and ", name.ranks[i6][3], " with a precision of ", format(round(precision.ranks[i6][3], 6), nsmall = 6), ".")
+
+```
+
+`r toString(myString)`
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+accuracy.ranks <- c(
+  fho.knn.accuracy,
+  fho.lda.accuracy,
+  fho.qda.accuracy,
+  fho.glm.accuracy,
+  fho.rf.accuracy,
+  fho.svm.linear.accuracy,
+  fho.svm.radial.accuracy,
+  fho.svm.poly.accuracy)
+
+auc.ranks <- c(fho.knn.AUC,
+               fho.lda.AUC,
+               fho.qda.AUC,
+               fho.glm.AUC,
+               fho.rf.AUC,
+               fho.svm.linear.AUC,
+               fho.svm.radial.AUC,
+               fho.svm.poly.AUC)
+
+sensitivity.ranks <- c(fho.knn.sensitivity,
+                       fho.lda.sensitivity,
+                       fho.qda.sensitivity,
+                       fho.glm.sensitivity,
+                       fho.rf.sensitivity,
+                       fho.svm.linear.sensitivity,
+                       fho.svm.radial.sensitivity,
+                       fho.svm.poly.sensitivity)
+
+specificity.ranks <- c(fho.knn.specificity,
+                       fho.lda.specificity,
+                       fho.qda.specificity,
+                       fho.glm.specificity,
+                       fho.rf.specificity,
+                       fho.svm.linear.specificity,
+                       fho.svm.radial.specificity,
+                       fho.svm.poly.specificity)
+
+fdr.ranks <- c(fho.knn.FDR,
+               fho.lda.FDR,
+               fho.qda.FDR,
+               fho.glm.FDR,
+               fho.rf.FDR,
+               fho.svm.linear.FDR,
+               fho.svm.radial.FDR,
+               fho.svm.poly.FDR)
+
+precision.ranks <- c(fho.knn.precision,
+                     fho.lda.precision,
+                     fho.qda.precision,
+                     fho.glm.precision,
+                     fho.rf.precision,
+                     fho.svm.linear.precision,
+                     fho.svm.radial.precision,
+                     fho.svm.poly.precision)
+
+i1 <- sort(accuracy.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i2 <- sort(auc.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i3 <- sort(sensitivity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i4 <- sort(specificity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+i5 <- sort(fdr.ranks, index.return=TRUE, decreasing = FALSE)$ix
+i6 <- sort(precision.ranks, index.return=TRUE, decreasing = TRUE)$ix
+
+myString2 = paste0("After running our models against the FHO provided and ordering the models that performed well on the hold-out data according to accuracy was ",name.ranks[i1][1], " with an accuracy of ", format(round(accuracy.ranks[i1][1], 6), nsmall = 6)," followed by ", name.ranks[i1][2], " with an accuracy of ",format(round(accuracy.ranks[i1][2], 6), nsmall = 6), " and ", name.ranks[i1][3], " with an accuracy of ",format(round(accuracy.ranks[i1][3], 6), nsmall = 6),". ","Ordering according to AUC, the best model is the ", name.ranks[i2][1], " with an AUC of ", format(round(auc.ranks[i2][1], 6), nsmall = 6), " followed by ", name.ranks[i2][2], " with an AUC of ", format(round(auc.ranks[i2][2], 6), nsmall = 6), " and ", name.ranks[i2][3], " with an AUC of ", format(round(auc.ranks[i2][3], 6), nsmall = 6), ". ","Ordering the results by sensitivity, the best model is the ", name.ranks[i3][1], " with a sensitivity of ", format(round(sensitivity.ranks[i3][1], 6), nsmall = 6), " followed by ", name.ranks[i3][2], " with a sensitivity of ", format(round(sensitivity.ranks[i3][2], 6), nsmall = 6), " and ", name.ranks[i3][3], " with a sensitivity of ", format(round(sensitivity.ranks[i3][3], 6), nsmall = 6), ". ","Ordering the models again by specificity, the best model is the ", name.ranks[i4][1], " with a specificity of ", format(round(specificity.ranks[i4][1], 6), nsmall = 6), " followed by ", name.ranks[i4][2], " with a specificity of ", format(round(specificity.ranks[i4][2], 6), nsmall = 6), " and ", name.ranks[i4][3], " with a specificity of ", format(round(specificity.ranks[i4][3], 6), nsmall = 6), ". ","The algorithms according to the FDR performance on the hold-out data was ", name.ranks[i5][1], " with a FDR of ", format(round(fdr.ranks[i5][1], 6), nsmall = 6), " followed by ", name.ranks[i5][2], " with a FDR of ", format(round(fdr.ranks[i5][2], 6), nsmall = 6), " and ", name.ranks[i5][3], " with a FDR of ", format(round(fdr.ranks[i5][3], 6), nsmall = 6), ". ","Lastly against the precision, the best model is the ", name.ranks[i6][1], " with a precision of ", format(round(precision.ranks[i6][1], 6), nsmall = 6), " followed by ", name.ranks[i6][2], " with a precision of ", format(round(precision.ranks[i6][2], 6), nsmall = 6), " and ", name.ranks[i6][3], " with a precision of ", format(round(precision.ranks[i6][3], 6), nsmall = 6), ".")
+
+```
+
+`r toString(myString2)`
+
+When looking to decide what is the best model to select, the accuracy can play a part in deciding which algorithm to select. If we were to rank each algorithm based off the accuracy:
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+accuracy.ranks <- c(knn.Accuracy,lda.Accuracy,qda.Accuracy,glm.Accuracy,rf.Accuracy,svm.linear.Accuracy,svm.radial.Accuracy,svm.poly.Accuracy)
+i1 <- sort(accuracy.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC1 <- name.ranks[i1]
+
+accuracy.ranks <- c(
+  fho.knn.accuracy,
+  fho.lda.accuracy,
+  fho.qda.accuracy,
+  fho.glm.accuracy,
+  fho.rf.accuracy,
+  fho.svm.linear.accuracy,
+  fho.svm.radial.accuracy,
+  fho.svm.poly.accuracy)
+
+i2 <- sort(accuracy.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC2 <- name.ranks[i2]
+
+df = data.frame(ACC1,ACC2)
+
+
+colnames(df) <- c("TRAIN" , "FHO TEST")
+rownames(df) <- c("Rank 1","Rank 2","Rank 3","Rank 4","Rank 5","Rank 6","Rank 7","Rank 8")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+We can see that algorithms based on non-linear classifications rank near the top especially for the Random Forest Model, K Nearest Neighbors and Support Vector Machines with a Radial Kernel while the algorithms based on linear classifications ( Linear discriminant, Support Vector Machines with Linear Kernel ) had a much lower ranked accuracy.
+
+However, accuracy is not the only metric to use in validating which model to use. We can rank the models by precision:
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+precision.ranks <- c(knn.Precision, lda.Precision,qda.Precision,glm.Precision,rf.Precision,svm.linear.Precision,svm.radial.Precision,svm.poly.Precision)
+
+i1 <- sort(precision.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC1 <- name.ranks[i1]
+
+precision.ranks <- c(fho.knn.precision,
+                     fho.lda.precision,
+                     fho.qda.precision,
+                     fho.glm.precision,
+                     fho.rf.precision,
+                     fho.svm.linear.precision,
+                     fho.svm.radial.precision,
+                     fho.svm.poly.precision)
+
+i2 <- sort(precision.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC2 <- name.ranks[i2]
+
+df = data.frame(ACC1,ACC2)
+
+
+colnames(df) <- c("TRAIN" , "FHO TEST")
+rownames(df) <- c("Rank 1","Rank 2","Rank 3","Rank 4","Rank 5","Rank 6","Rank 7","Rank 8")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+and by recall:
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+sensitivity.ranks <- c(knn.Sensitivity,lda.Sensitivity,qda.Sensitivity,glm.Sensitivity,rf.Sensitivity,svm.linear.Sensitivity,svm.radial.Sensitivity,svm.poly.Sensitivity)
+
+i1 <- sort(sensitivity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC1 <- name.ranks[i1]
+
+sensitivity.ranks <- c(fho.knn.sensitivity,
+                       fho.lda.sensitivity,
+                       fho.qda.sensitivity,
+                       fho.glm.sensitivity,
+                       fho.rf.sensitivity,
+                       fho.svm.linear.sensitivity,
+                       fho.svm.radial.sensitivity,
+                       fho.svm.poly.sensitivity)
+
+i2 <- sort(sensitivity.ranks, index.return=TRUE, decreasing = TRUE)$ix
+ACC2 <- name.ranks[i2]
+
+df = data.frame(ACC1,ACC2)
+
+
+colnames(df) <- c("TRAIN" , "FHO TEST")
+rownames(df) <- c("Rank 1","Rank 2","Rank 3","Rank 4","Rank 5","Rank 6","Rank 7","Rank 8")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+It's important to note these models are generated from point estimates from the 10-fold cross-validation training. As such, I would recommend using the Random Forest model for detection of blue tarps. The mean and standard deviation point estimates from the 10-fold cross-validation for this model ( metrics Sensitivity, Specificity and Precision) :
+
+* Sensitivity Mean: `r toString(classifier.rf.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.rf.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.rf.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.rf.specificity.sd)`
+
+* Precision Mean: `r toString(classifier.rf.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.rf.precision.sd)`
+
+
+with the KNN Model as a close second. The mean and standard deviation point estimates from the 10-fold cross-validation for this model ( metrics Sensitivity, Specificity and Precision):
+
+* Sensitivity Mean: `r toString(classifier.knn.sensitivity.mean)`
+
+* Sensitivity Standard Deviation: `r toString(classifier.knn.sensitivity.sd)`
+
+* Specificity Mean: `r toString(classifier.knn.specificity.mean)`
+
+* Specificity Standard Deviation: `r toString(classifier.knn.specificity.sd)`
+
+* Precision Mean: `r toString(classifier.knn.precision.mean)`
+
+* Precision Standard Deviation: `r toString(classifier.knn.precision.sd)`
+
+The models do not behave the same when measuring the prediction against the training set of data and the final hold out test set but this reasoning can be attributed to many various factors. The rationale regarding which algorithm to use for detection of blue tarps in part can also explain why the training data and test data ranks do not exactly match but tend to fall into the same areas for linear / non linear models. It's important to keep in mind that the data is an unbalanced classification set. The variables associated with this data set are additive colors of the RBG color spectrum. This data formulation allows us to address it with predictive modeling tools since the variables stem from the data being an unbalanced  binary classification ( an unequal distribution of classes in the training dataset and FHO).  This in turn means that within the metrics, there is a greater chance that a negatives that can be classified as a false positive. Although the models tested using FHO data has low precision overall compared to the training data, the sensitivity and specificity tend to be relatively higher and consistent with the training data. In addition, the based on the False Discovery Rate,
+
+```{r}
+name.ranks <- c("KNN","LDA","QDA", "Logistic Regression", "Random Forest", "SVM with Linear Kernel","SVM with Radial Kernel","SVM with Polynomial Kernel" )
+
+fdr.ranks <- c(knn.FDR, lda.FDR,qda.FDR,glm.FDR,rf.FDR,svm.linear.FDR,svm.radial.FDR,svm.poly.FDR)
+
+
+i1 <- sort(fdr.ranks, index.return=TRUE, decreasing = FALSE)$ix
+FDR1 <- name.ranks[i1]
+
+fdr.ranks <- c(fho.knn.FDR,
+               fho.lda.FDR,
+               fho.qda.FDR,
+               fho.glm.FDR,
+               fho.rf.FDR,
+               fho.svm.linear.FDR,
+               fho.svm.radial.FDR,
+               fho.svm.poly.FDR)
+
+i2 <- sort(fdr.ranks, index.return=TRUE, decreasing = FALSE)$ix
+FDR2 <- name.ranks[i2]
+
+df = data.frame(FDR1,FDR2)
+
+
+colnames(df) <- c("TRAIN" , "FHO TEST")
+rownames(df) <- c("Rank 1","Rank 2","Rank 3","Rank 4","Rank 5","Rank 6","Rank 7","Rank 8")
+df %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+Random Forest and KNN both rank near the top, indicating that these models have lower chances of getting a false positive.
+
+In an extension of part 1 discussions on software aspects, we expect SVMs to take the longest performance which is shown in the above table on elapsed time. The time required to do 10-fold cross validation adjusted for using tuning parameters far exceed those for LDA, QDA, GLM, etc. To avoid overfitting in the Random Forest Model, Ntree was set to 500 and not iterated across various values of ntree since Random Forest already appeared to be one of the top models. The trade-off of timing for small increases in accuracy force the analysis to lean more on saving time where possible. We have iterated across reasonable values of cost, sigma, degree , etc for the various models but we do not expect the results to change position. Quadratic and polynomial based algorithms exceeded linear based algorithms with Random Forest decision trees and K-Nearest Neighbors standing above the rest however; it's worth pointing out that the uncertainties based on the mean and standard deviation for the various metrics can have the models flip-flop in rankings.
+
+# Resources
+
+* https://rdrr.io/cran/caret/man/models.html
+
+* http://www.sthda.com/english/articles/36-classification-methods-essentials/144-svm-model-support-vector-machine-essentials/
+
+* https://blog.revolutionanalytics.com/2016/05/using-caret-to-compare-models.html
+
+* https://stats.stackexchange.com/questions/371439/partial-effects-plots-vs-partial-dependence-plots-for-random-forests
+
+* https://stats.stackexchange.com/questions/158583/what-does-node-size-refer-to-in-the-random-forest
+
+* https://blog.revolutionanalytics.com/2015/10/the-5th-tribe-support-vector-machines-and-caret.html
+
+* https://topepo.github.io/caret/parallel-processing.html
+
+* https://stackoverflow.com/questions/52422201/r-parallelmakecluster-hangs-on-mac
+
+* https://scikit-learn.org/stable/auto_examples/model_selection/plot_precision_recall.html
+
+* https://machinelearningmastery.com/threshold-moving-for-imbalanced-classification/
+
+* https://machinelearningmastery.com/what-is-imbalanced-classification/
+
+* https://developers.google.com/machine-learning/crash-course/classification/roc-and-auc
+
+* https://www.statisticshowto.com/false-discovery-rate/
+
+* https://stats.stackexchange.com/questions/49226/how-to-interpret-f-measure-values
+
+* https://support.sas.com/resources/papers/proceedings17/0942-2017.pdf
+
+* https://topepo.github.io/caret/data-splitting.html
+
